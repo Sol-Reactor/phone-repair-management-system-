@@ -1,0 +1,428 @@
+// PRQMS - Phone Repair Queue Management System
+// Prisma schema - Phase 1
+// Entities per SRS section 6.1: Customer, Ticket, RepairType, PriceList, Config
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum TicketStatus {
+  WAITING
+  IN_PROGRESS
+  DONE
+  COLLECTED
+  CANCELLED
+}
+
+// Customer-facing narrative for the guest tracker (/track). Deliberately
+// separate from TicketStatus above, which drives the internal queue/ETA
+// scheduler — these stages don't map 1:1 onto it (WAITING_ON_PARTS in
+// particular is a side-flag during an active repair, not a queue state).
+enum RepairStage {
+  DROPPED_OFF
+  DIAGNOSING
+  WAITING_ON_PARTS
+  REPAIRING
+  READY_FOR_PICKUP
+}
+
+// Pre-Repair Checklist (liability protection): condition of the device as
+// received, recorded by the technician BEFORE the ticket is allowed to move
+// WAITING -> IN_PROGRESS (enforced in updateTicketStatus, not just the UI).
+// Protects the shop from "you broke my camera" disputes after the fact.
+enum ScreenCondition {
+  SCRATCHED
+  CRACKED
+  PERFECT
+}
+
+// ---------------------------------------------------------------------------
+// Staff accounts — real per-user logins (replaces the old single shared
+// admin password stored in Config["admin_password_hash"]). ADMIN = owner,
+// full access including financials (wholesale, analytics, stock costs).
+// TECHNICIAN = worker, day-to-day queue/ticket access only.
+// ---------------------------------------------------------------------------
+
+enum Role {
+  ADMIN
+  TECHNICIAN
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  name         String
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  role         Role     @default(TECHNICIAN)
+  // Incremented on password change to revoke every previously issued JWT.
+  tokenVersion Int      @default(0) @map("token_version")
+
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// Customer & device registration (FR-1.x)
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id          Int      @id @default(autoincrement())
+  name        String
+  phoneNumber String   @map("phone_number")
+  // Optional: not in the original intake form, added so the Ready-for-Pickup
+  // notification service has somewhere to send an email. SMS (using
+  // phoneNumber, always present) is the fallback when it's missing.
+  email       String?
+  // Set by the Telegram bot's /start deep-link handler (see
+  // lib/telegramService.ts), not by any admin-facing form: the customer
+  // taps a "Get updates on Telegram" link containing their ticket's
+  // trackingCode, and the bot resolves that back to this row. The Bot API
+  // has no way to message a phone number or @username directly — a chat_id
+  // only exists once the user has started a chat with the bot themselves.
+  telegramChatId String? @map("telegram_chat_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  tickets Ticket[]
+
+  @@index([phoneNumber])
+  @@index([name])
+  @@map("customers")
+}
+
+// ---------------------------------------------------------------------------
+// Ticket = one repair registration (FR-1.x, FR-2.x, FR-3.x)
+// ---------------------------------------------------------------------------
+
+model Ticket {
+  id                 Int      @id @default(autoincrement())
+  customerId          Int      @map("customer_id")
+  customer             Customer @relation(fields: [customerId], references: [id])
+
+  deviceBrand         String   @map("device_brand")
+  deviceModel         String   @map("device_model")
+
+  repairTypeId         Int      @map("repair_type_id")
+  repairType            RepairType @relation(fields: [repairTypeId], references: [id])
+
+  problemDescription  String   @map("problem_description")
+
+  // FR-1.: optional PIN, AES-256 encrypted at the application layer before storage (NFR-4)
+  devicePin           String?  @map("device_pin")
+
+  status              TicketStatus @default(WAITING)
+  repairStage         RepairStage  @default(DROPPED_OFF) @map("repair_stage")
+
+  // Short, non-sequential public code for the guest tracker — deliberately
+  // NOT the numeric `id`, since that's sequential and would let anyone
+  // enumerate other customers' tickets. Generated in application code
+  // (see lib/trackingCode.ts), not a Prisma-level default, so we control
+  // the character set/length for something a customer can type easily.
+  trackingCode        String       @unique @map("tracking_code")
+
+  registeredAt        DateTime @default(now()) @map("registered_at")
+  startedAt           DateTime? @map("started_at")
+  completedAt         DateTime? @map("completed_at")
+
+  estimatedStartTime  DateTime? @map("estimated_start_time")
+  estimatedCost       Decimal  @db.Decimal(10, 2) @map("estimated_cost")
+  actualCost          Decimal? @db.Decimal(10, 2) @map("actual_cost")
+
+  // Nullable: cancelled/collected tickets fall out of the active queue ordering
+  queuePosition       Int?     @map("queue_position")
+
+  notes               String?
+  cancellationReason  String?  @map("cancellation_reason") // FR-2.9
+
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  preRepairChecklist  PreRepairChecklist?
+
+  @@index([status])
+  @@index([queuePosition])
+  @@index([registeredAt])
+  @@map("tickets")
+}
+
+// ---------------------------------------------------------------------------
+// PreRepairChecklist — one per Ticket, filled out by the technician before
+// the ticket can move to IN_PROGRESS. See ScreenCondition enum above for why.
+// ---------------------------------------------------------------------------
+
+model PreRepairChecklist {
+  id                   Int             @id @default(autoincrement())
+  ticketId             Int             @unique @map("ticket_id")
+  ticket               Ticket          @relation(fields: [ticketId], references: [id])
+
+  screenCondition      ScreenCondition @map("screen_condition")
+  touchFaceIdWorking   Boolean         @map("touch_faceid_working")
+  camerasWorking       Boolean         @map("cameras_working")
+  chargingPortWorking  Boolean         @map("charging_port_working")
+  technicianNotes      String?         @map("technician_notes")
+
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  @@map("pre_repair_checklists")
+}
+
+// ---------------------------------------------------------------------------
+// RepairType (FR-6.1) - e.g. Screen Replacement, Battery, Water Damage
+// ---------------------------------------------------------------------------
+
+model RepairType {
+  id                        Int    @id @default(autoincrement())
+  name                      String @unique
+  estimatedDurationMinutes  Int    @map("estimated_duration_minutes")
+
+  tickets    Ticket[]
+  priceList  PriceList[]
+
+  @@map("repair_types")
+}
+
+// ---------------------------------------------------------------------------
+// PriceList (FR-3.1, FR-3.2) - Repair Type x Device Brand -> base price
+// deviceBrand = null represents the default fallback price for that repair type
+// ---------------------------------------------------------------------------
+
+model PriceList {
+  id            Int        @id @default(autoincrement())
+  repairTypeId  Int        @map("repair_type_id")
+  repairType    RepairType @relation(fields: [repairTypeId], references: [id])
+
+  // null = default/fallback price for this repair type across all brands (FR-3.2)
+  deviceBrand   String?    @map("device_brand")
+  basePrice     Decimal    @db.Decimal(10, 2) @map("base_price")
+
+  createdAt     DateTime   @default(now()) @map("created_at")
+  updatedAt     DateTime   @updatedAt @map("updated_at")
+
+  @@unique([repairTypeId, deviceBrand])
+  @@map("price_list")
+}
+
+// ---------------------------------------------------------------------------
+// Config (FR-6.1) - key/value store: shop name, hours, lunch break, password hash, etc.
+// ---------------------------------------------------------------------------
+
+model Config {
+  key   String @id
+  value String
+
+  @@map("config")
+}
+
+// Admin inbox workflow: a message starts UNREAD, flips to READ the moment an
+// admin opens it, and becomes REPLIED only once an admin sends a reply
+// (which is also the only way replyText/repliedAt get set). READ and
+// REPLIED never revert to UNREAD automatically — only an explicit action.
+enum ContactMessageStatus {
+  UNREAD
+  READ
+  REPLIED
+}
+
+// ---------------------------------------------------------------------------
+// ContactMessage - "Get in Touch" submissions from the public marketing site.
+// Deliberately separate from Ticket: this is a general inquiry/feedback
+// channel, not a repair booking, so it has no repairType/device/queue fields
+// and never touches the queue scheduler. The sender gets a plain reference
+// number (id, shown as "C-<id>") to quote if they follow up — not a repair
+// ticket ID or tracking code.
+// ---------------------------------------------------------------------------
+
+model ContactMessage {
+  id         Int                  @id @default(autoincrement())
+  name       String
+  email      String
+  phone      String?
+  message    String
+
+  status     ContactMessageStatus @default(UNREAD)
+
+  // Set together, only by POST /api/contact/:id/reply.
+  replyText  String?              @map("reply_text")
+  repliedAt  DateTime?            @map("replied_at")
+
+  createdAt  DateTime             @default(now()) @map("created_at")
+  updatedAt  DateTime             @default(now()) @updatedAt
+
+  @@index([createdAt])
+  @@index([status])
+  @@map("contact_messages")
+}
+
+// ---------------------------------------------------------------------------
+// B2B Wholesale Parts Distribution — separate branch of the business that
+// sells parts to external city technicians on credit. Deliberately its own
+// set of models (not reusing Customer/Ticket): these buyers aren't repair
+// customers, and a distribution is a stock-out + debt event, not a repair.
+// ---------------------------------------------------------------------------
+
+// PAID: balanceDue = 0. PARTIAL: amountPaid > 0 and < totalAmount.
+// LOAN: amountPaid = 0 (took the part entirely on credit).
+enum PaymentStatus {
+  PAID
+  PARTIAL
+  LOAN
+}
+
+model WholesaleItem {
+  id            Int      @id @default(autoincrement())
+  name          String
+  category      String
+  stockQuantity Int      @default(0) @map("stock_quantity")
+  unitPrice     Decimal  @db.Decimal(10, 2) @map("unit_price")
+  // Advanced Stock Management: below this, the item shows up on the Smart
+  // Shopping List (GET /admin/stock/low). Admin-configurable per item —
+  // a fast-moving screen and a rarely-used connector shouldn't share one
+  // global threshold.
+  minStockLevel Int      @default(5) @map("min_stock_level")
+
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  distributions DistributionLedger[]
+  restocks      RestockLog[]
+  defects       DefectiveLog[]
+
+  @@index([category])
+  @@index([name])
+  @@map("wholesale_items")
+}
+
+// The city buyers who take parts on credit. totalDebt is a running balance,
+// kept in sync with DistributionLedger.balanceDue inside the same
+// transaction that creates each ledger entry (see wholesaleController).
+model ExternalTechnician {
+  id           Int      @id @default(autoincrement())
+  name         String
+  phone        String
+  shopLocation String   @map("shop_location")
+  totalDebt    Decimal  @default(0) @db.Decimal(10, 2) @map("total_debt")
+
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  distributions DistributionLedger[]
+
+  @@index([phone])
+  @@index([totalDebt])
+  @@map("external_technicians")
+}
+
+// One row per part hand-out. Immutable transaction record — later payments
+// against a LOAN/PARTIAL balance should be modeled as new rows or a future
+// PaymentRecord model, not by mutating amountPaid/balanceDue here in place.
+model DistributionLedger {
+  id                   Int      @id @default(autoincrement())
+
+  wholesaleItemId      Int           @map("wholesale_item_id")
+  wholesaleItem        WholesaleItem @relation(fields: [wholesaleItemId], references: [id])
+
+  externalTechnicianId Int                @map("external_technician_id")
+  externalTechnician   ExternalTechnician @relation(fields: [externalTechnicianId], references: [id])
+
+  quantityTaken        Int           @map("quantity_taken")
+  totalAmount          Decimal       @db.Decimal(10, 2) @map("total_amount")
+  amountPaid           Decimal       @default(0) @db.Decimal(10, 2) @map("amount_paid")
+  balanceDue           Decimal       @default(0) @db.Decimal(10, 2) @map("balance_due")
+  paymentStatus        PaymentStatus @map("payment_status")
+
+  createdAt            DateTime @default(now()) @map("created_at")
+
+  @@index([externalTechnicianId])
+  @@index([wholesaleItemId])
+  @@index([paymentStatus])
+  @@index([createdAt])
+  @@map("distribution_ledger")
+}
+
+// ---------------------------------------------------------------------------
+// Advanced Stock Management — the INBOUND side of the same WholesaleItem
+// catalog that DistributionLedger sells OUTBOUND from. Same items, opposite
+// direction: RestockLog is stock coming in from a Supplier, DefectiveLog is
+// stock leaving (broken, not sold) without a sale to show for it.
+//
+// NOTE on DefectiveLog "reportedBy": kept as a plain free-text name field
+// rather than a User relation, even though a real User model now exists
+// (see above) — switching this to a foreign key is a separate follow-up,
+// not part of the auth/RBAC work.
+// ---------------------------------------------------------------------------
+
+model Supplier {
+  id       Int    @id @default(autoincrement())
+  name     String
+  phone    String
+  location String
+
+  restocks RestockLog[]
+
+  @@index([phone])
+  @@map("suppliers")
+}
+
+// One row per restock event. Immutable, like DistributionLedger — a
+// mis-entered restock should be corrected with a new row, not by mutating
+// this one, so the inbound history stays an honest audit trail.
+model RestockLog {
+  id              Int      @id @default(autoincrement())
+
+  wholesaleItemId Int           @map("wholesale_item_id")
+  wholesaleItem   WholesaleItem @relation(fields: [wholesaleItemId], references: [id])
+
+  supplierId      Int      @map("supplier_id")
+  supplier        Supplier @relation(fields: [supplierId], references: [id])
+
+  quantityAdded   Int      @map("quantity_added")
+  unitCostPrice   Decimal  @db.Decimal(10, 2) @map("unit_cost_price")
+  totalCost       Decimal  @db.Decimal(10, 2) @map("total_cost")
+
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@index([wholesaleItemId])
+  @@index([supplierId])
+  @@index([createdAt])
+  @@map("restock_log")
+}
+
+// WAITING_FOR_REFUND: sitting in the physical "waste bin", not yet taken
+// back to the supplier. REFUNDED: supplier has credited/replaced it — the
+// loop is closed and it drops off the active Defective/Returns table.
+enum DefectiveStatus {
+  WAITING_FOR_REFUND
+  REFUNDED
+}
+
+model DefectiveLog {
+  id              Int             @id @default(autoincrement())
+
+  wholesaleItemId Int             @map("wholesale_item_id")
+  wholesaleItem   WholesaleItem   @relation(fields: [wholesaleItemId], references: [id])
+
+  quantity        Int
+  reason          String
+  // See the model-group comment above: free-text, not a User relation —
+  // this app has no per-technician accounts to relate to.
+  reportedBy      String          @map("reported_by")
+  status          DefectiveStatus @default(WAITING_FOR_REFUND)
+
+  createdAt       DateTime        @default(now()) @map("created_at")
+
+  @@index([wholesaleItemId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("defective_log")
+}

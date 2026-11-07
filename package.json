@@ -1,0 +1,26 @@
+{
+  "name": "prqms-web",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev:backend": "npm run dev --workspace=apps/backend",
+    "dev:frontend": "npm run dev --workspace=apps/frontend",
+    "prisma:generate": "npm run prisma:generate --workspace=apps/backend"
+  },
+  "overrides": {
+    "react-native": "0.81.5",
+    "nativewind": {
+      "react": "19.1.0",
+      "react-native": "0.81.5",
+      "react-native-css-interop": "0.2.6"
+    },
+    "react-native-css-interop": {
+      ".": "0.2.6",
+      "react": "19.1.0",
+      "react-native": "0.81.5"
+    }
+  }
+}

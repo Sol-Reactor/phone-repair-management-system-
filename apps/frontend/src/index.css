@@ -1,0 +1,83 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ------------------------------------------------------------------ */
+/* PRQMS Brand Design System                                          */
+/* Three core colors:                                                 */
+/*   --brand-accent:    #FEB730  (golden amber)                       */
+/*   --brand-secondary: #C7F8FE  (light cyan)                        */
+/*   --brand-dark:      #001619  (deep dark teal)                    */
+/* ------------------------------------------------------------------ */
+
+@layer base {
+  :root {
+    --brand-accent: #FEB730;
+    --brand-accent-hover: #E5A329;
+    --brand-accent-active: #CC9124;
+    --brand-secondary: #C7F8FE;
+    --brand-secondary-hover: #A8F0FB;
+    --brand-dark: #001619;
+    --brand-dark-surface: #0B2529;
+    --brand-dark-hover: #14353B;
+    --brand-dark-border: #1D474E;
+
+    scrollbar-color: #cbd5e1 transparent;
+  }
+
+  .dark {
+    scrollbar-color: #1d474e transparent;
+  }
+
+  body {
+    @apply bg-slate-50 text-slate-900 transition-colors duration-200 antialiased;
+  }
+
+  .dark body {
+    @apply bg-brand-dark text-slate-100;
+  }
+
+  /* Staff screens (dashboard/admin): Fira Code headings for a precise,
+     technical feel. Public pages keep Fira Sans headings. */
+  .staff-ui h1,
+  .staff-ui h2,
+  .staff-ui h3 {
+    @apply font-mono tracking-tight;
+  }
+
+  /* Numbers line up in columns (prices, quantities, times) */
+  table {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Every interactive element shows it is clickable */
+  button:not(:disabled),
+  [role="button"],
+  a[href],
+  select,
+  summary,
+  label[for],
+  input[type="checkbox"],
+  input[type="radio"] {
+    cursor: pointer;
+  }
+
+  /* Focus ring accessibility */
+  *:focus-visible {
+    outline: 2px solid var(--brand-accent);
+    outline-offset: 2px;
+  }
+}
+
+/* Respect the OS "reduce motion" preference for CSS animations/transitions
+   (framer-motion is handled separately via <MotionConfig reducedMotion="user">). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
